@@ -98,7 +98,7 @@ namespace SwordBeam
             spawnedItem.IgnoreRagdollCollision(Player.local.creature.ragdoll);
             spawnedItem.IgnoreObjectCollision(item);
             spawnedItem.RefreshCollision(true);
-            spawnedItem.gameObject.AddComponent<SwordBeam>().Setup(beamDamage, dismember, beamColor, beamEmission, beamSize, beamScaleIncrease);
+            spawnedItem.gameObject.AddComponent<SwordBeam>().Setup(beamDamage, dismember, beamColor, beamEmission, beamSize, beamScaleIncrease, item);
             spawnedItem.Throw();
             spawnedItem.Despawn(despawnTime);
         }
@@ -106,22 +106,26 @@ namespace SwordBeam
     public class SwordBeam : MonoBehaviour
     {
         Item item;
+        Item origin;
         float damage;
         bool dismember;
         public Color BeamColor;
         public Color BeamEmission;
         public Vector3 BeamSize;
         public Vector3 BeamScaleIncrease;
-        Vector3 initialPosition = new Vector3();
         List<RagdollPart> parts = new List<RagdollPart>();
+        Imbue imbue;
         public void Start()
         {
             item = GetComponent<Item>();
             item.renderers[0].material.SetColor("_BaseColor", BeamColor);
             item.renderers[0].material.SetColor("_EmissionColor", BeamEmission * 2f);
             item.renderers[0].gameObject.transform.localScale = BeamSize;
+            imbue = item.colliderGroups[0].imbue;
+            if (origin.colliderGroups[0].imbue is Imbue originImbue && originImbue.spellCastBase != null && originImbue.energy > 0)
+                imbue.Transfer(originImbue.spellCastBase, origin.colliderGroups[0].imbue.maxEnergy);
         }
-        public void Setup(float Damage, bool Dismember, Color color, Color emission, Vector3 size, Vector3 scale)
+        public void Setup(float Damage, bool Dismember, Color color, Color emission, Vector3 size, Vector3 scale, Item original)
         {
             damage = Damage;
             dismember = Dismember;
@@ -129,13 +133,11 @@ namespace SwordBeam
             BeamEmission = emission;
             BeamSize = size;
             BeamScaleIncrease = scale;
-        }
-        public void FixedUpdate()
-        {
-            item.gameObject.transform.localScale += BeamScaleIncrease;
+            origin = original;
         }
         public void Update()
         {
+            item.gameObject.transform.localScale += BeamScaleIncrease * (Time.deltaTime * 100);
             if (parts.Count > 0)
             {
                 parts[0].gameObject.SetActive(true);
@@ -148,27 +150,59 @@ namespace SwordBeam
         }
         public void OnTriggerEnter(Collider c)
         {
-            if (c.GetComponentInParent<ColliderGroup>() != null)
+            if (c.GetComponentInParent<ColliderGroup>() is ColliderGroup group && group.collisionHandler.isRagdollPart)
             {
-                ColliderGroup enemy = c.GetComponentInParent<ColliderGroup>();
-                if (enemy?.collisionHandler?.ragdollPart != null && enemy?.collisionHandler?.ragdollPart?.ragdoll?.creature != Player.currentCreature)
+                RagdollPart part = group.collisionHandler.ragdollPart;
+                if (!part.ragdoll.creature.isPlayer && part.ragdoll.creature.gameObject.activeSelf == true && !part.isSliced)
                 {
-                    RagdollPart part = enemy.collisionHandler.ragdollPart;
-                    if (part.ragdoll.creature != Player.currentCreature && part?.ragdoll?.creature?.gameObject?.activeSelf == true && part != null && !part.isSliced)
+                    CollisionInstance instance = new CollisionInstance(new DamageStruct(DamageType.Slash, damage))
                     {
-                        if (part.sliceAllowed && dismember)
+                        targetCollider = c,
+                        targetColliderGroup = group,
+                        sourceColliderGroup = item.colliderGroups[0],
+                        sourceCollider = item.colliderGroups[0].colliders[0],
+                        casterHand = origin.lastHandler.caster,
+                        impactVelocity = item.rb.velocity,
+                        contactPoint = c.transform.position,
+                        contactNormal = -item.rb.velocity
+                    };
+                    instance.damageStruct.penetration = DamageStruct.Penetration.None;
+                    instance.damageStruct.hitRagdollPart = part;
+                    if (part.sliceAllowed && dismember)
+                    {
+                        Vector3 direction = part.GetSliceDirection();
+                        float num1 = Vector3.Dot(direction, item.transform.up);
+                        float num2 = 1f / 3f;
+                        if (num1 < num2 && num1 > -num2 && !parts.Contains(part))
                         {
-                            if (!parts.Contains(part))
-                                parts.Add(part);
-                        }
-                        else if (!part.ragdoll.creature.isKilled)
-                        {
-                            CollisionInstance instance = new CollisionInstance(new DamageStruct(DamageType.Slash, damage));
-                            instance.damageStruct.hitRagdollPart = part;
-                            part.ragdoll.creature.Damage(instance);
-                            part.ragdoll.creature.TryPush(Creature.PushType.Hit, (part.transform.position - initialPosition).normalized, 1);
+                            parts.Add(part);
                         }
                     }
+                    if (imbue.spellCastBase?.GetType() == typeof(SpellCastLightning))
+                    {
+                        part.ragdoll.creature.TryElectrocute(1, 2, true, true, (imbue.spellCastBase as SpellCastLightning).imbueHitRagdollEffectData);
+                        imbue.spellCastBase.OnImbueCollisionStart(instance);
+                    }
+                    if (imbue.spellCastBase?.GetType() == typeof(SpellCastProjectile))
+                    {
+                        instance.damageStruct.damage *= 2;
+                        imbue.spellCastBase.OnImbueCollisionStart(instance);
+                    }
+                    if (imbue.spellCastBase?.GetType() == typeof(SpellCastGravity))
+                    {
+                        imbue.spellCastBase.OnImbueCollisionStart(instance);
+                        part.ragdoll.creature.TryPush(Creature.PushType.Hit, item.rb.velocity, 3, part.type);
+                        part.rb.AddForce(item.rb.velocity, ForceMode.VelocityChange);
+                    }
+                    else
+                    {
+                        if (imbue.spellCastBase != null && imbue.energy > 0)
+                        {
+                            imbue.spellCastBase.OnImbueCollisionStart(instance);
+                        }
+                        part.ragdoll.creature.TryPush(Creature.PushType.Hit, item.rb.velocity, 1, part.type);
+                    }
+                    part.ragdoll.creature.Damage(instance);
                 }
             }
         }
